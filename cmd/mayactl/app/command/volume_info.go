@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	client "github.com/openebs/maya/pkg/client/jiva"
+	k8sclient "github.com/openebs/maya/pkg/client/k8s"
 	"github.com/openebs/maya/pkg/util"
 	"github.com/openebs/maya/types/v1"
 	"github.com/spf13/cobra"
@@ -37,11 +38,13 @@ type ReplicaInfo struct {
 	IP         string
 	AccessMode string
 	Status     string
+	NodeName   string
 }
 
 // CmdVolumeInfoOptions is used to store the value of flags used in the cli
 type CmdVolumeInfoOptions struct {
 	volName string
+	output  string
 }
 
 // NewCmdVolumeInfo shows info of OpenEBS Volume
@@ -59,6 +62,9 @@ func NewCmdVolumeInfo() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&options.volName, "volname", "n", options.volName,
 		"unique volume name.")
+
+	cmd.Flags().StringVarP(&options.output, "output", "o", options.output, "Wide output with Node Names")
+
 	return cmd
 }
 
@@ -66,6 +72,9 @@ func NewCmdVolumeInfo() *cobra.Command {
 func (c *CmdVolumeInfoOptions) Validate(cmd *cobra.Command) error {
 	if c.volName == "" {
 		return errors.New("--volname is missing. Please try running [mayactl volume list] to see list of volumes.")
+	}
+	if c.output != "wide" && c.output != "" {
+		return fmt.Errorf("error : output format %s not recognized\n", c.output)
 	}
 	return nil
 }
@@ -84,6 +93,7 @@ func (c *CmdVolumeInfoOptions) RunVolumeInfo(cmd *cobra.Command) error {
 		fmt.Printf("Unable to fetch volume details, Volume controller's status is '%s'.\n", annotation.ControllerStatus)
 		return nil
 	}
+
 	// Initiallize an instance of ReplicaCollection, json response recieved from the
 	// controllerIP:9501/v1/replicas is to be parsed into this structure via GetVolumeStats.
 	// An API needs to be passed as argument.
@@ -93,7 +103,30 @@ func (c *CmdVolumeInfoOptions) RunVolumeInfo(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
+
 	c.DisplayVolumeInfo(annotation, collection)
+	return nil
+}
+
+func updateReplicasInfoWithNodeName(replicaInfo map[int]*ReplicaInfo) error {
+	K8sClient, err := k8sclient.NewK8sClient("")
+	if err != nil {
+		return err
+	}
+
+	pods, err := K8sClient.GetPods()
+	if err != nil {
+		return err
+	}
+
+	for _, replica := range replicaInfo {
+		for _, pod := range pods {
+			if pod.Status.PodIP == replica.IP {
+				replica.NodeName = pod.Spec.NodeName
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -110,11 +143,20 @@ func (c *CmdVolumeInfoOptions) DisplayVolumeInfo(a *Annotations, collection clie
 	const (
 		replicaTemplate = `
 ================= Replica Details =================
-IP            AccessMode               Status
+IP             AccessMode              Status
 {{range $key, $value := .}}
 {{$value.IP}}     {{$value.AccessMode}}                       {{$value.Status}}
 {{end}}
 ===================================================
+`
+
+		replicaTemplateWithNodeName = `
+================= Replica Details ==================================
+IP            AccessMode               Status           Node
+{{range $key, $value := .}}
+{{$value.IP}}    {{$value.AccessMode}}                       {{$value.Status}}          {{$value.NodeName}}
+{{end}}
+====================================================================
 `
 		portalTemplate = `
 ================= Portal Details ==================
@@ -155,18 +197,40 @@ Status  :   {{.Status}}
 	// or in Pending or in ImagePullBackoff.In such cases it will show Waiting
 	// NA,  NA in Status, access mode and IP fields respectively.
 	replicaInfo := make(map[int]*ReplicaInfo)
-	for key, _ := range collection.Data {
-		address = append(address, strings.TrimSuffix(strings.TrimPrefix(collection.Data[key].Address, "tcp://"), v1.ReplicaPort))
-		mode = append(mode, collection.Data[key].Mode)
-		replicaInfo[key] = &ReplicaInfo{address[key], mode[key], "Running"}
-	}
-	if length < replicaCount {
-		for i := length; i < (replicaCount); i++ {
-			replicaInfo[i] = &ReplicaInfo{"NA", "       NA", "Waiting"}
+	if c.output == "wide" {
+		for key, _ := range collection.Data {
+			address = append(address, strings.TrimSuffix(strings.TrimPrefix(collection.Data[key].Address, "tcp://"), v1.ReplicaPort))
+			mode = append(mode, collection.Data[key].Mode)
+			replicaInfo[key] = &ReplicaInfo{address[key], mode[key], "Running", "Error Fetching Node"}
 		}
+
+		err = updateReplicasInfoWithNodeName(replicaInfo)
+		if err != nil {
+			fmt.Printf("Error in getting pods from K8s. Please try again with flag \"-o wide\"\n")
+		}
+
+		if length < replicaCount {
+			for i := length; i < (replicaCount); i++ {
+				replicaInfo[i] = &ReplicaInfo{"NA", "        NA", "Waiting", "NA"}
+			}
+		}
+		tmpl = template.New("ReplicaInfo")
+		tmpl = template.Must(tmpl.Parse(replicaTemplateWithNodeName))
+
+	} else {
+		for key, _ := range collection.Data {
+			address = append(address, strings.TrimSuffix(strings.TrimPrefix(collection.Data[key].Address, "tcp://"), v1.ReplicaPort))
+			mode = append(mode, collection.Data[key].Mode)
+			replicaInfo[key] = &ReplicaInfo{address[key], mode[key], "Running", ""}
+		}
+		if length < replicaCount {
+			for i := length; i < (replicaCount); i++ {
+				replicaInfo[i] = &ReplicaInfo{"NA", "        NA", "Waiting", ""}
+			}
+		}
+		tmpl = template.New("ReplicaInfo")
+		tmpl = template.Must(tmpl.Parse(replicaTemplate))
 	}
-	tmpl = template.New("ReplicaInfo")
-	tmpl = template.Must(tmpl.Parse(replicaTemplate))
 	err = tmpl.Execute(os.Stdout, replicaInfo)
 	if err != nil {
 		fmt.Println("Unable to display volume info, found error : ", err)
